@@ -64,7 +64,7 @@ class XrDataset(Dataset):
         decode=False,
         resize_factor=1,
         compute=False,
-        auto_padding=True,
+        auto_padding=False, #### /!\/!\/!\ ####
         interp_na=False,
     ):
         """
@@ -180,7 +180,6 @@ class XrDataset(Dataset):
 
 
         self.ds = self.ds.transpose("time", "lat", "lon")
-
         if self.interp_na:
             self.ds = interpolate_na_2D(self.ds)
 
@@ -257,6 +256,7 @@ class FourDVarNetDataset(Dataset):
         aug_train_data=False,
         compute=False,
         pp='std',
+        rand_obs=False,
     ):
         super().__init__()
         self.use_auto_padding=use_auto_padding
@@ -264,7 +264,7 @@ class FourDVarNetDataset(Dataset):
         self.aug_train_data = aug_train_data
         self.return_coords = False
         self.pp=pp
-
+        self.rand_obs = rand_obs
         self.gt_ds = XrDataset(
             gt_path, gt_var,
             slice_win=slice_win,
@@ -275,7 +275,7 @@ class FourDVarNetDataset(Dataset):
             resize_factor=resize_factor,
             compute=compute,
             auto_padding=use_auto_padding,
-            interp_na=True,
+            interp_na=False,
         )
         self.obs_mask_ds = XrDataset(
             obs_mask_path, obs_mask_var,
@@ -299,7 +299,7 @@ class FourDVarNetDataset(Dataset):
             resize_factor=resize_factor,
             compute=compute,
             auto_padding=use_auto_padding,
-            interp_na=True,
+            interp_na=False,
         )
 
         if sst_var is not None:
@@ -313,7 +313,7 @@ class FourDVarNetDataset(Dataset):
                 resize_factor=resize_factor,
                 compute=compute,
                 auto_padding=use_auto_padding,
-                interp_na=True,
+                interp_na=False,
             )
         else:
             self.sst_ds = None
@@ -382,11 +382,27 @@ class FourDVarNetDataset(Dataset):
         gt_item = _gt_item
 
         oi_item = np.where(~np.isnan(_oi_item), _oi_item, 0.)
-        # obs_mask_item = self.obs_mask_ds[item].astype(bool) & ~np.isnan(oi_item) & ~np.isnan(_gt_item)
 
-        obs_mask_item = ~np.isnan(_obs_item)
-        obs_item = np.where(~np.isnan(_obs_item), _obs_item, np.zeros_like(_obs_item))
-
+        if self.rand_obs:
+            obs_mask_item = ~np.isnan(gt_item)
+            _obs_item = gt_item
+            for t_ in range(self.slice_win.time):
+                obs_mask_item_t_ = obs_mask_item[t_]
+                if np.sum(obs_mask_item_t_)>.25*self.slice_win.lat*self.slice_win.lon:
+                    obs_obj = .5*np.sum(obs_mask_item_t_)
+                    while  np.sum(obs_mask_item_t_)>= obs_obj:
+                        half_patch_height = np.random.randint(2,10)
+                        half_patch_width = np.random.randint(2,10)
+                        idx_lat = np.random.randint(0,self.slice_win.lat)
+                        idx_lon = np.random.randint(0,self.slice_win.lon)
+                        obs_mask_item_t_[np.max([0,idx_lat-half_patch_height]):np.min([self.slice_win.lat,idx_lat+half_patch_height+1]),np.max([0,idx_lon-half_patch_width]):np.min([self.slice_win.lon,idx_lon+half_patch_width+1])] = 0
+                    obs_mask_item[t_] = obs_mask_item_t_
+            obs_mask_item = obs_mask_item == 1
+        else:
+            obs_mask_item = ~np.isnan(_obs_item)
+            
+        obs_item = np.where(obs_mask_item, _obs_item, np.zeros_like(_obs_item))
+        
         if self.sst_ds == None:
             return oi_item, obs_mask_item, obs_item, gt_item
         else:
@@ -423,7 +439,8 @@ class FourDVarNetDataModule(pl.LightningDataModule):
             dl_kwargs=None,
             compute=False,
             use_auto_padding=False,
-            pp='std'
+            pp='std',
+            rand_obs=False
     ):
         super().__init__()
         self.resize_factor = resize_factor
@@ -458,9 +475,10 @@ class FourDVarNetDataModule(pl.LightningDataModule):
         self.train_ds, self.val_ds, self.test_ds = None, None, None
         self.norm_stats = (0, 1)
         self.norm_stats_sst = None
-
+        self.rand_obs = rand_obs
 
     def mean_stds(self, ds):
+        print('mean,std : ')
         sum = 0
         count = 0
         for gt in [_it for _ds in ds.datasets for _it in _ds.gt_ds]:
@@ -471,7 +489,7 @@ class FourDVarNetDataModule(pl.LightningDataModule):
         for gt in [_it for _ds in ds.datasets for _it in _ds.gt_ds]:
             sum += np.nansum((gt - mean)**2)
         std = (sum / count)**0.5
-
+        print(str(mean)+' , '+str(std))
         if self.sst_var == None:
             return mean, std
         else:
@@ -495,12 +513,20 @@ class FourDVarNetDataModule(pl.LightningDataModule):
             M_sst = float(xr.concat([_ds.sst_ds.ds[_ds.sst_ds.var] for _ds in ds.datasets], dim='time').max())
 
             return [m, M-m], [m_sst, M_sst-m_sst]
+            
+    def noNorm(self, ds):
+        if self.sst_var == None:
+            return 0, 1
+        else:
+            return [0, 1], [0, 1]
 
     def compute_norm_stats(self, ds):
         if self.pp == 'std':
             return self.mean_stds(ds)
         elif self.pp == 'norm':
             return self.min_max(ds)
+        elif self.pp == None:
+            return self.noNorm(ds)
 
     def set_norm_stats(self, ds, ns, ns_sst=None):
         for _ds in ds.datasets:
@@ -548,8 +574,8 @@ class FourDVarNetDataModule(pl.LightningDataModule):
                 aug_train_data=self.aug_train_data,
                 compute=self.compute,
                 pp=self.pp,
+                rand_obs = self.rand_obs,
             ) for sl in self.train_slices])
-
 
         self.val_ds, self.test_ds = [
             ConcatDataset(
@@ -574,11 +600,11 @@ class FourDVarNetDataModule(pl.LightningDataModule):
                     compute=self.compute,
                     use_auto_padding=self.use_auto_padding,
                     pp=self.pp,
+                    rand_obs = False,
                 ) for sl in slices]
             )
             for slices in (self.val_slices, self.test_slices)
         ]
-
         if self.sst_var is None:
             self.norm_stats = self.compute_norm_stats(self.train_ds)
             self.set_norm_stats(self.train_ds, self.norm_stats)
